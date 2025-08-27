@@ -1,0 +1,76 @@
+name: Build & Deploy multi PHP apps
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_A: ghcr.io/<OWNER>/dateapp-app-a
+      IMAGE_B: ghcr.io/<OWNER>/dateapp-app-b
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
+
+      - name: Derive tag
+        id: tag
+        run: echo "TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build & push App A
+        run: |
+          docker build -t $IMAGE_A:${{ steps.tag.outputs.TAG }} -t $IMAGE_A:latest apps/app-a
+          docker push $IMAGE_A:${{ steps.tag.outputs.TAG }}
+          docker push $IMAGE_A:latest
+
+      - name: Build & push App B
+        run: |
+          docker build -t $IMAGE_B:${{ steps.tag.outputs.TAG }} -t $IMAGE_B:latest apps/app-b
+          docker push $IMAGE_B:${{ steps.tag.outputs.TAG }}
+          docker push $IMAGE_B:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy both apps atomically
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PATH_REMOTE: ${{ secrets.DEPLOY_PATH }}
+          TAG: sha-${{ github.sha }}
+        run: |
+          SHORT=${TAG:0:11}
+          ssh -o StrictHostKeyChecking=no $USER@$HOST bash -lc "
+            set -e
+            cd $PATH_REMOTE
+
+            # 1) APP_TAG átírás az új verzióra
+            if grep -q '^APP_TAG=' .env; then
+              sed -i 's/^APP_TAG=.*/APP_TAG='\"$SHORT\"'/' .env
+            else
+              echo APP_TAG=$SHORT >> .env
+            fi
+            echo 'Using APP_TAG=' \$(grep ^APP_TAG .env | cut -d= -f2)
+
+            # 2) Letöltjük az új image-eket
+            docker compose -f docker-compose.prod.yml pull
+
+            # 3) Mindkettő cseréje egyszerre
+            docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans
+
+            # 4) Állapot
+            docker compose -f docker-compose.prod.yml ps
+          "

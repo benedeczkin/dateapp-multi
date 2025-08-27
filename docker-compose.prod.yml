@@ -16,9 +16,9 @@ services:
       start_period: 10s
 
   php_a:
-    image: ghcr.io/<OWNER>/dateapp-app-a:${APP_TAG}
+    image: ghcr.io/benedeczkin/dateapp-app-a:${APP_TAG}
     restart: unless-stopped
 
   php_b:
-    image: ghcr.io/<OWNER>/dateapp-app-b:${APP_TAG}
+    image: ghcr.io/benedeczkin/dateapp-app-b:${APP_TAG}
     restart: unless-stopped

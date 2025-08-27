@@ -12,8 +12,8 @@ jobs:
       contents: read
     env:
       REGISTRY: ghcr.io
-      IMAGE_A: ghcr.io/<OWNER>/dateapp-app-a
-      IMAGE_B: ghcr.io/<OWNER>/dateapp-app-b
+      IMAGE_A: ghcr.io/benedeczkin/dateapp-app-a
+      IMAGE_B: ghcr.io/benedeczkin/dateapp-app-b
     steps:
       - uses: actions/checkout@v4
 

@@ -1,76 +1,123 @@
-name: Build & Deploy multi PHP apps
+name: Deploy
 
 on:
   push:
     branches: [ "main" ]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_A: ghcr.io/benedeczkin/dateapp-app-a
+  IMAGE_B: ghcr.io/benedeczkin/dateapp-app-b
+
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
-    env:
-      REGISTRY: ghcr.io
-      IMAGE_A: ghcr.io/benedeczkin/dateapp-app-a
-      IMAGE_B: ghcr.io/benedeczkin/dateapp-app-b
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
-
-      - name: Derive tag
-        id: tag
-        run: echo "TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-
-      - name: Build & push App A
-        run: |
-          docker build -t $IMAGE_A:${{ steps.tag.outputs.TAG }} -t $IMAGE_A:latest apps/app-a
-          docker push $IMAGE_A:${{ steps.tag.outputs.TAG }}
-          docker push $IMAGE_A:latest
-
-      - name: Build & push App B
-        run: |
-          docker build -t $IMAGE_B:${{ steps.tag.outputs.TAG }} -t $IMAGE_B:latest apps/app-b
-          docker push $IMAGE_B:${{ steps.tag.outputs.TAG }}
-          docker push $IMAGE_B:latest
-
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.9.0
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy both apps atomically
+      - name: Set image tag (short SHA)
+        id: tag
+        run: echo "APP_TAG=sha-${GITHUB_SHA::11}" >> $GITHUB_OUTPUT
+
+      - name: Build & push app-a
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/app-a
+          push: true
+          tags: ${{ env.IMAGE_A }}:${{ steps.tag.outputs.APP_TAG }}
+
+      - name: Build & push app-b
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/app-b
+          push: true
+          tags: ${{ env.IMAGE_B }}:${{ steps.tag.outputs.APP_TAG }}
+
+      # --- DEPLOY ---
+
+      - name: Deploy over SSH (maintenance + freeze + swap + smoke + cleanup)
+        uses: appleboy/ssh-action@v1.0.3
         env:
-          HOST: ${{ secrets.DEPLOY_HOST }}
-          USER: ${{ secrets.DEPLOY_USER }}
-          PATH_REMOTE: ${{ secrets.DEPLOY_PATH }}
-          TAG: sha-${{ github.sha }}
-        run: |
-          SHORT=${TAG:0:11}
-          ssh -o StrictHostKeyChecking=no $USER@$HOST bash -lc "
-            set -e
-            cd $PATH_REMOTE
+          APP_TAG: ${{ steps.tag.outputs.APP_TAG }}
+          REDIS_PASS: ${{ secrets.REDIS_PASS }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}        
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }} 
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}       
+          script: |
+            set -euo pipefail
 
-            # 1) APP_TAG átírás az új verzióra
+            LOG_DIR="/var/log/dateapp"
+            sudo mkdir -p "$LOG_DIR"
+            LOG_FILE="$LOG_DIR/deploy-$(date +%F_%H-%M-%S).log"
+
+            exec > >(tee -a "$LOG_FILE") 2>&1
+
+            cleanup() {
+              echo "[CLEANUP] Turning OFF maintenance & freeze (even if failed)"
+              set +e
+              # maintenance OFF
+              sudo rm -f /etc/nginx/maintenance.on
+              sudo nginx -t && sudo systemctl reload nginx || true
+              # freeze OFF
+              cd "$DEPLOY_PATH"
+              docker compose -f docker-compose.prod.yml exec -T redis \
+                sh -lc 'redis-cli -a "$REDIS_PASS" DEL app:freeze' || true
+            }
+            trap cleanup EXIT
+
+            echo "=== Deploy started at $(date -Is) ==="
+            echo "[INFO] Host: $(hostname)  User: $(whoami)"
+
+            cd "$DEPLOY_PATH"
+
+            echo "[STEP] Write APP_TAG to .env"
             if grep -q '^APP_TAG=' .env; then
-              sed -i 's/^APP_TAG=.*/APP_TAG='\"$SHORT\"'/' .env
+              sudo sed -i 's/^APP_TAG=.*/APP_TAG='"$APP_TAG"'/' .env
             else
-              echo APP_TAG=$SHORT >> .env
+              echo "APP_TAG=$APP_TAG" | sudo tee -a .env >/dev/null
             fi
-            echo 'Using APP_TAG=' \$(grep ^APP_TAG .env | cut -d= -f2)
 
-            # 2) Letöltjük az új image-eket
+            echo "[STEP] Maintenance ON"
+            echo on | sudo tee /etc/nginx/maintenance.on >/dev/null
+            sudo nginx -t && sudo systemctl reload nginx
+
+            echo "[STEP] Freeze ON (Redis)"
+            docker compose -f docker-compose.prod.yml exec -T redis \
+              sh -lc 'redis-cli -a "$REDIS_PASS" SET app:freeze 1'
+
+            echo "[STEP] Wait for idle (max 60s)"
+            for i in $(seq 1 30); do
+              A=$(curl -fsS http://127.0.0.1/a/__status || echo '{}')
+              B=$(curl -fsS http://127.0.0.1/b/__status || echo '{}')
+              echo "[IDLE] /a status: $A"
+              echo "[IDLE] /b status: $B"
+              echo "$A" | grep -q '"idle"[[:space:]]*:[[:space:]]*true' && A_IDLE=1 || A_IDLE=0
+              echo "$B" | grep -q '"idle"[[:space:]]*:[[:space:]]*true' && B_IDLE=1 || B_IDLE=0
+              if [ $A_IDLE -eq 1 ] && [ $B_IDLE -eq 1 ]; then
+                echo "[IDLE] Both idle."
+                break
+              fi
+              sleep 2
+            done
+
+            echo "[STEP] Pull new images & swap"
             docker compose -f docker-compose.prod.yml pull
-
-            # 3) Mindkettő cseréje egyszerre
             docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans
 
-            # 4) Állapot
-            docker compose -f docker-compose.prod.yml ps
-          "
+            echo "[STEP] Smoke tests"
+            curl -fsS http://127.0.0.1/a >/dev/null
+            curl -fsS http://127.0.0.1/b >/dev/null
+
+            echo "[STEP] SUCCESS — will cleanup (trap)"
+            echo "=== Deploy finished at $(date -Is) ==="

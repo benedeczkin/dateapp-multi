@@ -1,24 +1,64 @@
 services:
-  nginx:
-    image: nginx:1.27-alpine
-    ports: ["80:80"]
-    depends_on:
-      php_a: { condition: service_started }
-      php_b: { condition: service_started }
-    volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL","wget -qO- http://127.0.0.1:8081/health || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-
   php_a:
     image: ghcr.io/benedeczkin/dateapp-app-a:${APP_TAG}
+    ports:
+      - "127.0.0.1:9001:9000"
+    environment:
+      TZ: Europe/Budapest
+      REDIS_HOST: redis
+      REDIS_PORT: "${REDIS_PORT}"
+      REDIS_PASS: "${REDIS_PASS}"
+      REDIS_DB: "${REDIS_DB}"
+    depends_on:
+      - redis
     restart: unless-stopped
 
   php_b:
     image: ghcr.io/benedeczkin/dateapp-app-b:${APP_TAG}
+    ports:
+      - "127.0.0.1:9002:9000"
+    environment:
+      TZ: Europe/Budapest
+      REDIS_HOST: redis
+      REDIS_PORT: "${REDIS_PORT}"
+      REDIS_PASS: "${REDIS_PASS}"
+      REDIS_DB: "${REDIS_DB}"
+    depends_on:
+      - redis
     restart: unless-stopped
+
+  cron:
+    image: ghcr.io/benedeczkin/dateapp-app-a:${APP_TAG}
+    command: ["crond","-f","-l","2"]
+    environment:
+      TZ: Europe/Budapest
+      REDIS_HOST: redis
+      REDIS_PORT: "${REDIS_PORT}"
+      REDIS_PASS: "${REDIS_PASS}"
+      REDIS_DB: "${REDIS_DB}"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASS}
+      --databases 16
+      --save 900 1 --save 300 10 --save 60 10000
+      --maxmemory-policy noeviction
+    environment:
+      REDIS_PASS: "${REDIS_PASS}"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASS}", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

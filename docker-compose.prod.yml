@@ -1,6 +1,7 @@
 services:
   php_a:
-    image: ghcr.io/benedeczkin/dateapp-app-a:${APP_TAG}
+    #image: ghcr.io/benedeczkin/dateapp-app-a:${APP_TAG}
+    image: ghcr.io/benedeczkin/dateapp-app-ap:latest
     ports:
       - "127.0.0.1:9001:9000"
     environment:
@@ -14,7 +15,7 @@ services:
     restart: unless-stopped
 
   php_b:
-    image: ghcr.io/benedeczkin/dateapp-app-b:${APP_TAG}
+    image: ghcr.io/benedeczkin/dateapp-app-b:latest
     ports:
       - "127.0.0.1:9002:9000"
     environment:

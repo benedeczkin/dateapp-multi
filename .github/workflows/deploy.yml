@@ -1,94 +1,63 @@
-name: Build & Deploy multi PHP apps
+name: Build & Deploy
 
 on:
   push:
     branches: [ "main" ]
 
-permissions:
-  contents: read
-  packages: write   # GHCR push-hoz szükséges
-
-env:
-  REGISTRY: ghcr.io
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # GHCR login a futó workflow kontextusával
-      - name: Log in to GHCR
+      - name: Set SHORT_TAG
+        id: vars
+        run: echo "SHORT_TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare tags and image names
-        id: prep
+      - name: Build & Push app-a
         run: |
-          echo "SHORT_TAG=sha-${GITHUB_SHA::11}" >> $GITHUB_OUTPUT
-          echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
-          echo "IMAGE_A=${{ env.REGISTRY }}/${GITHUB_REPOSITORY_OWNER,,}/dateapp-app-a" >> $GITHUB_OUTPUT
-          echo "IMAGE_B=${{ env.REGISTRY }}/${GITHUB_REPOSITORY_OWNER,,}/dateapp-app-b" >> $GITHUB_OUTPUT
+          docker build -t ghcr.io/${{ github.repository_owner }}/dateapp-app-a:${{ env.SHORT_TAG }} ./apps/app-a
+          docker push ghcr.io/${{ github.repository_owner }}/dateapp-app-a:${{ env.SHORT_TAG }}
 
-      - name: Build & push App A
-        uses: docker/build-push-action@v6
-        with:
-          context: ./apps/app-a
-          push: true
-          tags: |
-            ${{ steps.prep.outputs.IMAGE_A }}:${{ steps.prep.outputs.SHORT_TAG }}
-            ${{ steps.prep.outputs.IMAGE_A }}:latest
-
-      - name: Build & push App B
-        uses: docker/build-push-action@v6
-        with:
-          context: ./apps/app-b
-          push: true
-          tags: |
-            ${{ steps.prep.outputs.IMAGE_B }}:${{ steps.prep.outputs.SHORT_TAG }}
-            ${{ steps.prep.outputs.IMAGE_B }}:latest
-
-      - name: Expose tag to next job
+      - name: Build & Push app-b
         run: |
-          echo "SHORT_TAG=${{ steps.prep.outputs.SHORT_TAG }}" >> $GITHUB_ENV
-          echo "IMAGE_A=${{ steps.prep.outputs.IMAGE_A }}" >> $GITHUB_ENV
-          echo "IMAGE_B=${{ steps.prep.outputs.IMAGE_B }}" >> $GITHUB_ENV
-        shell: bash
-
-      - name: Upload deploy meta
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-meta
-          path: |
-            ${{ github.workspace }}/.github
-        # csak jelző, hogy legyen artifact; a TAG-et env-ből olvassuk a következő jobban
+          docker build -t ghcr.io/${{ github.repository_owner }}/dateapp-app-b:${{ env.SHORT_TAG }} ./apps/app-b
+          docker push ghcr.io/${{ github.repository_owner }}/dateapp-app-b:${{ env.SHORT_TAG }}
 
   deploy:
-    needs: build-and-push
     runs-on: ubuntu-latest
-
+    needs: build-and-push
     steps:
-      - name: Restore envs from previous job
-        run: |
-          echo "SHORT_TAG=${{ env.SHORT_TAG }}" >> $GITHUB_OUTPUT
-        id: carry
-
-      - name: Deploy over SSH (maintenance + freeze + swap + smoke + cleanup)
+      - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          APP_TAG: ${{ env.SHORT_TAG }}
-          REDIS_PASS: ${{ secrets.REDIS_PASS }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}     # pl. /opt/dateapp-multi
         with:
-          host:     ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}        # pl. root vagy deploy
-          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -euo pipefail
+            set -Eeuo pipefail
+
+            # --- ÁLLÍTSD BE ITT A TELEPÍTÉSI ÚTVONALAT ---
+            DEPLOY_PATH="/opt/dateapp-multi"  # ha máshol van, itt írd át
+
+            # APP_TAG a build jobtól (GitHub env). Ha üres, adjunk defaultot.
+            APP_TAG="${APP_TAG:-${{ env.SHORT_TAG }}}"
+            if [ -z "${APP_TAG:-}" ]; then
+              APP_TAG="sha-$(date +%s)"
+            fi
+
+            echo "[DEBUG] DEPLOY_PATH=$DEPLOY_PATH  APP_TAG=$APP_TAG"
 
             LOG_DIR="/var/log/dateapp"
             sudo mkdir -p "$LOG_DIR"
@@ -96,55 +65,57 @@ jobs:
             exec > >(tee -a "$LOG_FILE") 2>&1
 
             cleanup() {
-              echo "[CLEANUP] Turning OFF maintenance & freeze (even if failed)"
+              echo "[CLEANUP] Maintenance & Freeze OFF"
               set +e
               sudo rm -f /etc/nginx/maintenance.on
               sudo nginx -t && sudo systemctl reload nginx || true
-              cd "$DEPLOY_PATH"
-              docker compose -f docker-compose.prod.yml exec -T redis \
-                sh -lc 'redis-cli -a "$REDIS_PASS" DEL app:freeze' || true
+
+              DCY="$DEPLOY_PATH/docker-compose.prod.yml"
+              if [ -f "$DCY" ] && [ -f "$DEPLOY_PATH/.env" ]; then
+                REDIS_PASS=$(grep -E '^REDIS_PASS=' "$DEPLOY_PATH/.env" | sed 's/^REDIS_PASS=//')
+                if [ -n "$REDIS_PASS" ]; then
+                  docker compose -f "$DCY" exec -T redis \
+                    sh -lc 'redis-cli -a "$REDIS_PASS" DEL app:freeze' || true
+                fi
+              fi
             }
             trap cleanup EXIT
 
             echo "=== Deploy started at $(date -Is) ==="
-            cd "$DEPLOY_PATH"
 
-            # 1) APP_TAG frissítés a .env-ben
-            if grep -q '^APP_TAG=' .env; then
-              sudo sed -i 's/^APP_TAG=.*/APP_TAG='"${GITHUB_SHA:0:11}"'/' .env
-            else
-              echo "APP_TAG=${GITHUB_SHA:0:11}" | sudo tee -a .env >/dev/null
+            DCY="$DEPLOY_PATH/docker-compose.prod.yml"
+
+            # 0) REDIS_PASS kiolvasása a szerver .env-ből
+            REDIS_PASS=""
+            if [ -f "$DEPLOY_PATH/.env" ]; then
+              REDIS_PASS=$(grep -E '^REDIS_PASS=' "$DEPLOY_PATH/.env" | sed 's/^REDIS_PASS=//')
             fi
 
-            # 2) Maintenance ON (NGINX) + Freeze ON (Redis)
+            # 1) APP_TAG frissítése a szerver .env-ben
+            if grep -q '^APP_TAG=' "$DEPLOY_PATH/.env" 2>/dev/null; then
+              sudo sed -i 's/^APP_TAG=.*/APP_TAG='"$APP_TAG"'/' "$DEPLOY_PATH/.env"
+            else
+              echo "APP_TAG=$APP_TAG" | sudo tee -a "$DEPLOY_PATH/.env" >/dev/null
+            fi
+
+            # 2) Maintenance + Freeze ON
             echo on | sudo tee /etc/nginx/maintenance.on >/dev/null
             sudo nginx -t && sudo systemctl reload nginx
 
-            docker compose -f docker-compose.prod.yml exec -T redis \
-              sh -lc 'redis-cli -a "$REDIS_PASS" SET app:freeze 1'
+            if [ -n "$REDIS_PASS" ]; then
+              docker compose -f "$DCY" exec -T redis \
+                sh -lc 'redis-cli -a "$REDIS_PASS" SET app:freeze 1'
+            else
+              echo "[WARN] REDIS_PASS üres; freeze flag most kimarad"
+            fi
 
-            # 3) Idle várakozás (max ~60s)
-            for i in $(seq 1 30); do
-              A=$(curl -fsS http://127.0.0.1/a/__status || echo '{}')
-              B=$(curl -fsS http://127.0.0.1/b/__status || echo '{}')
-              echo "[IDLE] /a: $A"
-              echo "[IDLE] /b: $B"
-              echo "$A" | grep -q '"idle"[[:space:]]*:[[:space:]]*true' && A_IDLE=1 || A_IDLE=0
-              echo "$B" | grep -q '"idle"[[:space:]]*:[[:space:]]*true' && B_IDLE=1 || B_IDLE=0
-              if [ $A_IDLE -eq 1 ] && [ $B_IDLE -eq 1 ]; then
-                echo "[IDLE] both idle"
-                break
-              fi
-              sleep 2
-            done
+            # 3) Pull + csere
+            docker compose -f "$DCY" pull
+            docker compose -f "$DCY" up -d --no-build --remove-orphans
 
-            # 4) Új képek lehúzása és konténerek cseréje
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans
-
-            # 5) Smoke tesztek
+            # 4) Smoke tesztek
             curl -fsS http://127.0.0.1/a >/dev/null
             curl -fsS http://127.0.0.1/b >/dev/null
 
-            echo "[DONE] Deploy OK — cleanup will run via trap"
+            echo "[DONE] Deploy OK — cleanup via trap"
             echo "=== Deploy finished at $(date -Is) ==="

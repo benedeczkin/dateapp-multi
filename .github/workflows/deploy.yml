@@ -1,79 +1,144 @@
-name: Build & Deploy
+name: Build & Deploy multi PHP apps
 
 on:
   push:
     branches: [ "main" ]
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
+      packages: write   # GHCR push
       contents: read
-      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_A: ghcr.io/benedeczkin/dateapp-app-a
+      IMAGE_B: ghcr.io/benedeczkin/dateapp-app-b
+    outputs:
+      short_tag: ${{ steps.tag.outputs.TAG }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set SHORT_TAG
-        id: vars
-        run: echo "SHORT_TAG=sha-${GITHUB_SHA::7}" >> $GITHUB_ENV
+      - name: Derive short tag
+        id: tag
+        run: echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
 
-      - name: Build & Push app-a
+      - name: Build & push App A
         run: |
-          docker build -t ghcr.io/${{ github.repository_owner }}/dateapp-app-a:${{ env.SHORT_TAG }} ./apps/app-a
-          docker push ghcr.io/${{ github.repository_owner }}/dateapp-app-a:${{ env.SHORT_TAG }}
+          docker build -t $IMAGE_A:${{ steps.tag.outputs.TAG }} -t $IMAGE_A:latest apps/app-a
+          docker push $IMAGE_A:${{ steps.tag.outputs.TAG }}
+          docker push $IMAGE_A:latest
 
-      - name: Build & Push app-b
+      - name: Build & push App B
         run: |
-          docker build -t ghcr.io/${{ github.repository_owner }}/dateapp-app-b:${{ env.SHORT_TAG }} ./apps/app-b
-          docker push ghcr.io/${{ github.repository_owner }}/dateapp-app-b:${{ env.SHORT_TAG }}
+          docker build -t $IMAGE_B:${{ steps.tag.outputs.TAG }} -t $IMAGE_B:latest apps/app-b
+          docker push $IMAGE_B:${{ steps.tag.outputs.TAG }}
+          docker push $IMAGE_B:latest
 
   deploy:
-    runs-on: ubuntu-latest
     needs: build-and-push
+    runs-on: ubuntu-latest
     steps:
-      - name: Deploy to server
+      - name: Deploy to server (maintenance + freeze + swap)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script:
+          port: 22
+          timeout: 30s
+          command_timeout: 15m
+          envs: APP_TAG
+          script: |
             set -Eeuo pipefail
 
+            # --- TELEPÍTÉSI ÚTVONAL ---
             DEPLOY_PATH="/opt/dateapp-multi"
-            APP_TAG="${APP_TAG:-latest}"
 
-            echo "[INFO] Deploying to $DEPLOY_PATH with tag $APP_TAG"
+            # APP_TAG átadása a build jobtól (outputs). Ha üres, legyen fallback időbélyeg.
+            APP_TAG="${APP_TAG:-${{ needs.build-and-push.outputs.short_tag }}}"
+            if [ -z "${APP_TAG:-}" ]; then
+              APP_TAG="sha-$(date +%s)"
+            fi
 
-            # 1. karbantartás bekapcsolása
-            touch /etc/nginx/maintenance.on
-            systemctl reload nginx
+            echo "[DEBUG] DEPLOY_PATH=$DEPLOY_PATH  APP_TAG=$APP_TAG"
 
-            # 2. freeze ON redis-ben
-            docker compose -f "$DEPLOY_PATH/docker-compose.prod.yml" exec -T php_a \
-              php -r 'new Redis(["host"=>getenv("REDIS_HOST"),"port"=>getenv("REDIS_PORT"),"auth"=>getenv("REDIS_PASS")])->set("app:freeze",1);'
+            LOG_DIR="/var/log/dateapp"
+            sudo mkdir -p "$LOG_DIR"
+            LOG_FILE="$LOG_DIR/deploy-$(date +%F_%H-%M-%S).log"
+            exec > >(tee -a "$LOG_FILE") 2>&1
 
-            # 3. konténerek frissítése
-            cd "$DEPLOY_PATH"
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans
+            cleanup() {
+              echo "[CLEANUP] Maintenance & Freeze OFF"
+              set +e
+              sudo rm -f /etc/nginx/maintenance.on
+              sudo nginx -t && sudo systemctl reload nginx || true
 
-            # 4. karbantartás kikapcsolása (innentől érhető el a site)
-            rm -f /etc/nginx/maintenance.on
-            systemctl reload nginx
+              DCY="$DEPLOY_PATH/docker-compose.prod.yml"
+              if [ -f "$DCY" ] && [ -f "$DEPLOY_PATH/.env" ]; then
+                REDIS_PASS=$(grep -E '^REDIS_PASS=' "$DEPLOY_PATH/.env" | sed 's/^REDIS_PASS=//')
+                if [ -n "$REDIS_PASS" ]; then
+                  docker compose -f "$DCY" exec -T redis \
+                    sh -lc 'redis-cli -a "$REDIS_PASS" DEL app:freeze' || true
+                fi
+              fi
+            }
+            trap cleanup EXIT
 
-            # 5. smoke teszt (most már 200-at kell adjon)
-            curl -fsS http://localhost/a || exit 1
-            curl -fsS http://localhost/b || exit 1
+            echo "=== Deploy started at $(date -Is) ==="
 
-            # 6. freeze OFF
-            docker compose -f "$DEPLOY_PATH/docker-compose.prod.yml" exec -T php_a \
-              php -r 'new Redis(["host"=>getenv("REDIS_HOST"),"port"=>getenv("REDIS_PORT"),"auth"=>getenv("REDIS_PASS")])->del("app:freeze");'
+            DCY="$DEPLOY_PATH/docker-compose.prod.yml"
+
+            # 0) REDIS_PASS kiolvasása a szerver .env-ből
+            REDIS_PASS=""
+            if [ -f "$DEPLOY_PATH/.env" ]; then
+              REDIS_PASS=$(grep -E '^REDIS_PASS=' "$DEPLOY_PATH/.env" | sed 's/^REDIS_PASS=//')
+            fi
+
+            # 1) APP_TAG frissítése a szerver .env-ben
+            if grep -q '^APP_TAG=' "$DEPLOY_PATH/.env" 2>/dev/null; then
+              sudo sed -i 's/^APP_TAG=.*/APP_TAG='"$APP_TAG"'/' "$DEPLOY_PATH/.env"
+            else
+              echo "APP_TAG=$APP_TAG" | sudo tee -a "$DEPLOY_PATH/.env" >/dev/null
+            fi
+
+            # 2) Maintenance + Freeze ON (új kérések tiltása, háttér befejeződhet)
+            echo on | sudo tee /etc/nginx/maintenance.on >/dev/null
+            sudo nginx -t && sudo systemctl reload nginx
+
+            if [ -n "$REDIS_PASS" ]; then
+              docker compose -f "$DCY" exec -T redis \
+                sh -lc 'redis-cli -a "$REDIS_PASS" SET app:freeze 1'
+            else
+              echo "[WARN] REDIS_PASS üres; freeze flag kimarad"
+            fi
+
+            # 3) Új képek lehúzása + konténerek cseréje
+            docker compose -f "$DCY" pull
+            docker compose -f "$DCY" up -d --no-build --remove-orphans
+
+            # 4) Maintenance OFF, hogy a smoke teszt már ne 503-at kapjon
+            sudo rm -f /etc/nginx/maintenance.on
+            sudo nginx -t && sudo systemctl reload nginx
+
+            # 5) Smoke tesztek (200 kell legyen)
+            curl -fsS http://127.0.0.1/a >/dev/null
+            curl -fsS http://127.0.0.1/b >/dev/null
+
+            # 6) Freeze OFF (akkor is lefut a trap-ben, de itt is megpróbáljuk)
+            if [ -n "${REDIS_PASS:-}" ]; then
+              docker compose -f "$DCY" exec -T redis \
+                sh -lc 'redis-cli -a "$REDIS_PASS" DEL app:freeze'
+            fi
+
+            echo "[DONE] Deploy OK"
+            echo "=== Deploy finished at $(date -Is) ==="
